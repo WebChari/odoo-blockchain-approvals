@@ -3,43 +3,9 @@
 A tamper-evident governance layer that anchors ERP approval decisions on-chain.
 Built as a capstone MVP for a GCC SME consulting proposition.
 
-**Status:** Phase 1 in progress — contract live on Sepolia, relayer in build.
+**Status:** Phase 1 in progress — contract live on Sepolia, relayer operational, end-to-end happy path confirmed.
 
 ---
-
-## What it does
-
-When a purchase order is approved in Odoo, a cryptographic hash of the approval
-payload (PO ID, amount, approver, timestamp) is computed and recorded permanently
-on the Ethereum Sepolia testnet. The on-chain record cannot be altered. Any
-subsequent change to the Odoo record produces a different hash — proving tampering.
-
-This creates a tamper-evident audit trail without requiring the business to change
-how it works.
-
----
-
-## Architecture
-
-<!-- Architecture diagram will be added in Week 11 -->
-_Diagram coming. See [docs/screenshots](docs/screenshots/) for current progress._
-
-**Nine-step flow:**
-1. User approves a PO in Odoo above a threshold
-2. Odoo automation rule fires a webhook to the relayer
-3. Relayer computes `keccak256(abi.encode(poId, amount, approver, timestamp))`
-4. Relayer calls `recordApproval()` on the deployed smart contract
-5. Contract stores the hash and emits `ApprovalRecorded` event on Sepolia
-6. Relayer writes the transaction hash back to the Odoo record
-7. Verification page recomputes the hash and calls `verify()` — returns true
-   for untampered records, false for altered ones
-8. GRN confirmation in Odoo triggers a second anchor — goods received,
-   quantity matched, invoice validated — hash written to chain as a
-   separate `ApprovalRecorded` event linked to the original PO hash
-9. Smart contract payment decision fires: on-chain USDC transfer for
-   crypto-willing vendors; triggered bank transfer instructions for
-   traditional vendors — settlement rail is flexible, vendor crypto
-   adoption is not required
 
 ## What it does
 
@@ -58,15 +24,22 @@ how it works.
 <!-- Architecture diagram will be added in Week 11 -->
 _Diagram coming. See [docs/screenshots](docs/screenshots/) for current progress._
 
-**Seven-step flow:**
+**Nine-step flow:**
 1. User approves a PO in Odoo above a threshold
 2. Odoo automation rule fires a webhook to the relayer
-3. Relayer computes `keccak256(abi.encode(poId, amount, approver, timestamp))`
+3. Relayer computes `keccak256(abi.encodePacked(poId, amount, approver, timestamp))`
 4. Relayer calls `recordApproval()` on the deployed smart contract
 5. Contract stores the hash and emits `ApprovalRecorded` event on Sepolia
 6. Relayer writes the transaction hash back to the Odoo record
 7. Verification page recomputes the hash and calls `verify()` — returns true
    for untampered records, false for altered ones
+8. GRN confirmation in Odoo triggers a second anchor — goods received,
+   quantity matched, invoice validated — hash written to chain as a
+   separate `ApprovalRecorded` event linked to the original PO hash
+9. Smart contract payment decision fires: on-chain USDC transfer for
+   crypto-willing vendors; triggered bank transfer instructions for
+   traditional vendors — settlement rail is flexible, vendor crypto
+   adoption is not required
 
 ---
 
@@ -93,7 +66,7 @@ single named access point. Server-level access logs provide the corresponding
 forensic trail.
 
 ### Layer 3 — On-Chain Hash (Independent Detection)
-At approval, a SHA-256 hash of the full transaction payload is written to the
+At approval, a keccak256 hash of the full transaction payload is written to the
 Sepolia testnet. This hash is external, independent, and controlled by no party
 in the client organisation. Any alteration to the original record — at any
 layer — produces a hash mismatch on verification, regardless of how the
@@ -175,13 +148,14 @@ See [odoo/automation_rule_setup.md](odoo/automation_rule_setup.md).
 ## Roadmap
 
 - [x] ApprovalRegistry contract deployed to Sepolia
-- [ ] Odoo webhook → relayer wire-up
-- [ ] Transaction hash written back to Odoo record
+- [x] Odoo webhook → relayer wire-up
+- [x] Transaction hash written back to Odoo record
 - [ ] Verification page
 - [ ] Full acceptance test passing (happy path + tamper test)
 - [ ] Architecture diagram
 - [ ] Recorded demo walkthrough
-- [ ] Phase 2: AI agent layer for autonomous Odoo navigation and on-chain anchoring
+- [ ] Phase 2: On-chain USDC escrow and release (crypto-willing vendors)
+- [ ] Phase 3: AI agent layer for autonomous Odoo navigation and on-chain anchoring
 
 ---
 
