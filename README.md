@@ -24,6 +24,40 @@ how it works.
 <!-- Architecture diagram will be added in Week 11 -->
 _Diagram coming. See [docs/screenshots](docs/screenshots/) for current progress._
 
+**Nine-step flow:**
+1. User approves a PO in Odoo above a threshold
+2. Odoo automation rule fires a webhook to the relayer
+3. Relayer computes `keccak256(abi.encode(poId, amount, approver, timestamp))`
+4. Relayer calls `recordApproval()` on the deployed smart contract
+5. Contract stores the hash and emits `ApprovalRecorded` event on Sepolia
+6. Relayer writes the transaction hash back to the Odoo record
+7. Verification page recomputes the hash and calls `verify()` — returns true
+   for untampered records, false for altered ones
+8. GRN confirmation in Odoo triggers a second anchor — goods received,
+   quantity matched, invoice validated — hash written to chain as a
+   separate `ApprovalRecorded` event linked to the original PO hash
+9. Smart contract payment decision fires: on-chain USDC transfer for
+   crypto-willing vendors; triggered bank transfer instructions for
+   traditional vendors — settlement rail is flexible, vendor crypto
+   adoption is not required
+
+## What it does
+
+When a purchase order is approved in Odoo, a cryptographic hash of the approval
+payload (PO ID, amount, approver, timestamp) is computed and recorded on the
+Ethereum Sepolia testnet. Any subsequent change to the Odoo record produces a
+different hash — detecting tampering.
+
+This creates a tamper-evident audit trail without requiring the business to change
+how it works.
+
+---
+
+## Architecture
+
+<!-- Architecture diagram will be added in Week 11 -->
+_Diagram coming. See [docs/screenshots](docs/screenshots/) for current progress._
+
 **Seven-step flow:**
 1. User approves a PO in Odoo above a threshold
 2. Odoo automation rule fires a webhook to the relayer
@@ -33,6 +67,54 @@ _Diagram coming. See [docs/screenshots](docs/screenshots/) for current progress.
 6. Relayer writes the transaction hash back to the Odoo record
 7. Verification page recomputes the hash and calls `verify()` — returns true
    for untampered records, false for altered ones
+
+---
+
+## Security Architecture & Threat Model
+
+Zhets+ addresses tamper risk across three independent layers. No single layer
+does everything — together they constitute a defence-in-depth governance model.
+
+### Layer 1 — Application Controls (Odoo)
+Anchor records (`zhets.anchor`) are protected at the model level via `write()`
+and `unlink()` overrides. Any attempt to modify or delete an anchor through the
+Odoo application — regardless of user role, including administrator — raises an
+error and is blocked. Field-level tracking (`tracking=True`) on the source
+transaction records all subsequent changes via Odoo chatter, capturing the user,
+timestamp, and old/new values.
+
+### Layer 2 — Infrastructure Segregation of Duties
+Direct PostgreSQL access bypasses the Odoo application layer and sits outside
+application-level controls. The recommended client configuration restricts direct
+DB access to one named individual at executive level (CEO or equivalent DBA).
+This is an organisational Segregation of Duties control: if a hash mismatch
+cannot be explained by Odoo chatter, accountability is already assigned to a
+single named access point. Server-level access logs provide the corresponding
+forensic trail.
+
+### Layer 3 — On-Chain Hash (Independent Detection)
+At approval, a SHA-256 hash of the full transaction payload is written to the
+Sepolia testnet. This hash is external, independent, and controlled by no party
+in the client organisation. Any alteration to the original record — at any
+layer — produces a hash mismatch on verification, regardless of how the
+alteration was made.
+
+### What This Architecture Answers
+
+| Audit Question | Source |
+|---|---|
+| Was this record tampered with? | On-chain hash mismatch |
+| What was the original approved state? | `zhets.anchor.snapshot_json` |
+| What changed? | Field diff: snapshot vs current record |
+| Who changed it (app layer)? | Odoo chatter + `write_uid` |
+| Who had DB access? | PostgreSQL access logs + SoD control |
+
+### Accepted Boundary
+This system is tamper-evident, not tamper-proof. It detects and surfaces
+tampering; it does not physically prevent a sufficiently privileged actor from
+altering records. This is consistent with industry-standard audit and governance
+frameworks, where detection, accountability, and traceability are the operative
+controls.
 
 ---
 
