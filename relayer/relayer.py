@@ -1,13 +1,16 @@
 """
 relayer.py — Zhets+ Capstone Phase 1
 Receives Odoo approval webhooks, anchors a tamper-evident hash on Sepolia,
-and writes the transaction hash back to the Odoo PO record.
+writes the transaction hash back to the Odoo PO record, and exposes a
+/verify endpoint that recomputes the hash from live Odoo data and checks
+it against the chain.
 """
 
 import os
 import json
 import logging
 import xmlrpc.client
+from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 from web3 import Web3
 from dotenv import load_dotenv
@@ -36,7 +39,9 @@ log.info(f"Relayer wallet: {relayer_account.address}")
 
 CONTRACT_ADDRESS = Web3.to_checksum_address(os.getenv("CONTRACT_ADDRESS"))
 
-# Minimal ABI — only the two functions the relayer calls
+# Minimal ABI — only the functions the relayer and verifier call.
+# verify() confirmed callable on the deployed contract at CONTRACT_ADDRESS
+# (checked 2026-07-06).
 ABI = [
     {
         "name": "recordApproval",
@@ -82,7 +87,6 @@ def write_tx_hash_to_odoo(po_name: str, tx_hash: str, payload_hash: str):
 
         models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
 
-        # Find the PO by its name (e.g. "PO/2026/0001")
         po_ids = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
             'purchase.order', 'search',
@@ -95,7 +99,6 @@ def write_tx_hash_to_odoo(po_name: str, tx_hash: str, payload_hash: str):
 
         etherscan_url = f"https://sepolia.etherscan.io/tx/{tx_hash}"
 
-        # Post a note to the PO chatter with the tx hash and Etherscan link
         models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
             'purchase.order', 'message_post',
@@ -122,7 +125,24 @@ def write_tx_hash_to_odoo(po_name: str, tx_hash: str, payload_hash: str):
         return False
 
 
-# ── Hashing ───────────────────────────────────────────────────────────────────
+# ── Canonical hashing ──────────────────────────────────────────────────────────
+#
+# CANONICAL PAYLOAD SPEC (v1) — this is the single source of truth.
+# Any code that recomputes this hash (this relayer, the verification
+# endpoint below, a future rewrite in another language) MUST reproduce
+# exactly this byte layout or verify() will return false with no tampering.
+#
+#   poId          string   Odoo PO name, e.g. "PO/2026/0001"
+#   amountMicro   uint256  amount as integer micros (currency x 1,000,000)
+#   approver      string   Odoo login of the approving user — NOT an address
+#   erpTimestamp  uint256  unix epoch seconds of the approval event —
+#                          MUST be a write-once field, never write_date
+#                          (write_date changes on every subsequent edit
+#                          to the record, which would break verification
+#                          even when nothing relevant was tampered with)
+#
+#   hash = keccak256( utf8(poId) ++ be32(amountMicro) ++ utf8(approver) ++ be32(erpTimestamp) )
+#   == Solidity abi.encodePacked(string, uint256, string, uint256)
 
 def compute_payload_hash(
     po_id: str,
@@ -133,11 +153,11 @@ def compute_payload_hash(
     """
     Canonical hash: keccak256(encodePacked(poId, amountMicro, approver, erpTimestamp))
 
-    Amount is stored as integer micros (AED × 1,000,000) to avoid floating-point
+    Amount is stored as integer micros (AED x 1,000,000) to avoid floating-point
     precision differences between Python and Solidity.
 
     This exact computation must be reproduced identically on the verification page
-    for verify() to return true. Any field change → different hash → verify() false.
+    for verify() to return true. Any field change -> different hash -> verify() false.
     That is the tamper-evidence guarantee.
     """
     return Web3.solidity_keccak(
@@ -154,33 +174,15 @@ def anchor_on_chain(po_id: str, payload_hash: bytes) -> str:
     Signs the transaction with the relayer wallet (never the owner wallet).
     Waits for confirmation before returning.
     Returns the transaction hash as a 0x-prefixed hex string.
-
-    Uses EIP-1559 transaction pricing (type 0x2):
-    - baseFeePerGas: set by the network per block, burns on inclusion
-    - maxPriorityFeePerGas: tip paid to the validator — incentivises inclusion
-    - maxFeePerGas: absolute ceiling; actual fee = baseFee + priorityFee
-    Setting maxFeePerGas = 2x baseFee + priorityFee gives headroom if
-    the base fee rises between submission and inclusion.
     """
-
-    # Get the current nonce — number of transactions sent from this wallet
-    # Ethereum uses this to order and deduplicate transactions
     nonce = w3.eth.get_transaction_count(relayer_account.address)
 
-    # Read the base fee from the latest block
-    # baseFeePerGas is set by the network and burned (not paid to validators)
     latest_block = w3.eth.get_block('latest')
     base_fee = latest_block['baseFeePerGas']
 
-    # Priority fee (tip) paid directly to the validator for including our tx
-    # 2 gwei is more than enough on Sepolia testnet
     priority_fee = w3.to_wei(2, 'gwei')
-
-    # maxFeePerGas is our absolute ceiling
-    # = 2x base fee (buffer if base fee rises) + priority fee
     max_fee = (2 * base_fee) + priority_fee
 
-    # Build the transaction — type 0x2 means EIP-1559 pricing
     tx = contract.functions.recordApproval(po_id, payload_hash).build_transaction({
         'from':                 relayer_account.address,
         'nonce':                nonce,
@@ -190,24 +192,115 @@ def anchor_on_chain(po_id: str, payload_hash: bytes) -> str:
         'type':                 '0x2',
     })
 
-    # Sign the transaction locally with the relayer private key
-    # The private key never leaves this machine — only the signed bytes are broadcast
     signed = relayer_account.sign_transaction(tx)
-
-    # Broadcast the signed transaction to Sepolia via Alchemy
     tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction)
     log.info(f"Transaction sent: {tx_hash.hex()} — awaiting confirmation...")
 
-    # Wait up to 180 seconds for the transaction to be mined
-    # Increased from 120s to give Sepolia more time on busy periods
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
 
-    # Status 1 = success, status 0 = reverted
     if receipt.status != 1:
         raise RuntimeError(f"Transaction reverted. Hash: {tx_hash.hex()}")
 
     log.info(f"Confirmed in block {receipt.blockNumber}")
     return tx_hash.hex()
+
+
+# ── Verification ───────────────────────────────────────────────────────────────
+
+def get_po_snapshot_from_odoo(po_id: str) -> dict:
+    """
+    Reads the CURRENT state of the fields that feed the canonical hash.
+
+    Uses date_approve ("Confirmation Date") as the frozen approval timestamp.
+    Confirmed empirically (2026-07-06): this field is set once when the PO
+    is confirmed and does not move on subsequent chatter activity — unlike
+    write_date, which changes on every touch to the record and would break
+    verification even with no tampering. Still unverified: whether it holds
+    steady across an actual field edit (e.g. changing a line amount), not
+    just a chatter note — worth a second empirical check before relying on
+    this for a production tamper test.
+    """
+    common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
+    uid = common.authenticate(ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD, {})
+    models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
+
+    po_ids = models.execute_kw(
+        ODOO_DB, uid, ODOO_PASSWORD,
+        'purchase.order', 'search',
+        [[['name', '=', po_id]]]
+    )
+    if not po_ids:
+        raise ValueError(f"PO not found in Odoo: {po_id}")
+
+    fields = models.execute_kw(
+        ODOO_DB, uid, ODOO_PASSWORD,
+        'purchase.order', 'read',
+        [po_ids, ['amount_total', 'user_id', 'date_approve']]
+    )[0]
+
+    if not fields.get('date_approve'):
+        raise ValueError(
+            f"PO {po_id} has no date_approve set — likely not confirmed yet, "
+            f"cannot verify."
+        )
+
+    # Odoo XML-RPC returns datetime fields as naive strings, e.g.
+    # '2026-07-04 10:23:00' — no timezone marker, but always stored in UTC
+    # internally. Without explicitly tagging it UTC here, Python would treat
+    # it as local time and produce a different epoch value depending on the
+    # machine running this code — which would silently break verification
+    # for anyone not running in UTC.
+    approve_dt = datetime.strptime(
+        fields['date_approve'], '%Y-%m-%d %H:%M:%S'
+    ).replace(tzinfo=timezone.utc)
+
+    return {
+        'po_id':         po_id,
+        'amount_micro':  int(round(fields['amount_total'] * 1_000_000)),
+        'approver':      fields['user_id'][1] if fields.get('user_id') else '',
+        'erp_timestamp': int(approve_dt.timestamp()),
+    }
+
+
+def verify_po(po_id: str) -> dict:
+    """
+    Recomputes the canonical hash from the current Odoo record and asks
+    the contract directly whether it matches what was anchored at approval.
+    The comparison happens on-chain (contract.verify), not client-side —
+    there's nothing to fake by editing this script alone.
+    """
+    snap = get_po_snapshot_from_odoo(po_id)
+    payload_hash = compute_payload_hash(
+        snap['po_id'], snap['amount_micro'], snap['approver'], snap['erp_timestamp']
+    )
+    is_verified = contract.functions.verify(po_id, payload_hash).call()
+
+    return {
+        'po_id':           po_id,
+        'verified':        is_verified,
+        'recomputed_hash': payload_hash.hex(),
+        'snapshot_used':   snap,
+    }
+
+
+@app.route('/verify/<po_id>', methods=['GET'])
+def verify_endpoint(po_id):
+    """
+    GET /verify/PO%2F2026%2F0001
+
+    Recomputes the hash from live Odoo data and checks it against the chain.
+    Returns 'verified' (hashes match, record unaltered since approval) or
+    'tampered' (hashes differ — something changed after anchoring).
+    """
+    try:
+        result = verify_po(po_id)
+        result['status'] = 'verified' if result['verified'] else 'tampered'
+        return jsonify(result), 200
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 404
+    except Exception as e:
+        log.error(f"Verification failed for {po_id}: {e}")
+        return jsonify({'error': str(e)}), 500
 
 
 # ── Webhook endpoint ──────────────────────────────────────────────────────────
@@ -236,22 +329,16 @@ def handle_approval():
     if not po_id:
         return jsonify({'error': 'po_id is required'}), 400
 
-    # Store amount as integer micros to eliminate float precision risk
     amount_micro = int(round(float(amount) * 1_000_000))
 
     try:
-        # Step 1: compute canonical hash
         payload_hash       = compute_payload_hash(po_id, amount_micro, approver, erp_timestamp)
-        # payload_hash.hex() already returns the full 0x-prefixed string in web3.py v6
-        # no need to prepend 0x manually — doing so causes the double-prefix bug
         payload_hash_hex = payload_hash.hex()
         log.info(f"Payload hash: {payload_hash_hex}")
 
-        # Step 2: anchor on chain
         tx_hash = anchor_on_chain(po_id, payload_hash)
         log.info(f"Anchored: https://sepolia.etherscan.io/tx/{tx_hash}")
 
-        # Step 3: write tx hash back to Odoo PO chatter
         write_tx_hash_to_odoo(po_id, tx_hash, payload_hash_hex)
 
         return jsonify({
